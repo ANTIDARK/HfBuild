@@ -1,0 +1,53 @@
+# 必须在 http 块内，但在 server 块外
+map $http_authorization $api_key_valid {
+    default 0;
+    "Bearer ${API_KEY}" 1;
+    # 支持无空格格式
+    "Bearer${API_KEY}" 1;
+}
+
+server {
+    listen 7860;
+    server_name _;
+
+    # 日志输出到 stdout/stderr
+    access_log /dev/stdout;
+    error_log /dev/stderr;
+
+    # 健康检查端点（无需认证）
+    location /health {
+        access_log off;
+        return 200 "OK\n";
+        add_header Content-Type text/plain;
+    }
+
+    # Ollama API 端点（需要 API Key）
+    location / {
+        # 验证 API Key
+        if ($api_key_valid = 0) {
+            return 401 '{"error":"Unauthorized","message":"Invalid or missing API Key"}';
+        }
+
+        # 转发到 Ollama
+        proxy_pass http://127.0.0.1:11434;
+        proxy_http_version 1.1;
+
+        # 标准代理头
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # WebSocket 支持（流式响应）
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # 超时设置（长连接支持）
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+
+        # 禁用缓冲（优化流式传输）
+        proxy_buffering off;
+        proxy_cache off;
+    }
+}
