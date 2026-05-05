@@ -14,12 +14,15 @@ pinned: false
 
 # 变量设置
 ## 必填
-DATASET：私有dataset名称
-HF_USERNAME：hf的用户名
-HF_TOKEN：huggingface的具有write权限的token
-AUTH_USER：网页登陆用户名
-AUTH_PASSWORD：网页登陆密码
+DATASET：私有dataset名称  
+HF_USERNAME：hf的用户名  
+HF_TOKEN：huggingface的具有write权限的token  
+AUTH_USER：网页登陆用户名  
+AUTH_PASSWORD：网页登陆密码  
+BACKUP_MODE：timed 定时 / realtime 实时
+BACKUP_HISTORY_LIMIT：保留几份备份（建议 3~5）
+BACKUP_INTERVAL：定时备份间隔秒（600=10 分钟）
 ## 可选
-DATA_DIR：qwenpaw数据文件位置
-SECRET_DIR：qwenpaw使用的大模型密钥存储位置
+DATA_DIR：qwenpaw数据文件位置  
+SECRET_DIR：qwenpaw使用的大模型密钥存储位置  
 
