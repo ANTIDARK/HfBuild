@@ -1,10 +1,8 @@
-FROM python:3.11-slim
-
 WORKDIR /app
 
-# 安装依赖：nginx(密码) + HF官方备份库
+# 安装依赖：nginx(密码) + HF官方备份库 + inotify 实时监听
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends nginx apache2-utils && \
+    apt-get install -y --no-install-recommends nginx apache2-utils inotify-tools firefox-esr fonts-wqy-zenhei curl wget git gh tmux tar unzip && \    
     rm -rf /var/lib/apt/lists/*
 
 # 时区
