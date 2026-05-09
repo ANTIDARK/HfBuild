@@ -1,28 +1,47 @@
-metadata
 
-title: CoPaw
-emoji: 🤖
-colorFrom: blue
-colorTo: purple
-sdk: docker
-app_port: 7860
-pinned: false
+QwenPaw 私有部署
 
-公开 Space + 密码保护 → 保活不休眠
-私有 Dataset 备份 → 防数据泄露
-通过inotifywait监测文件变化实现实时备份
+HuggingFace Spaces 一键部署 | 自动备份 + 实时同步
+项目简介
 
-# 变量设置
-## 必填
-DATASET：私有dataset名称  
-HF_USERNAME：hf的用户名  
-HF_TOKEN：huggingface的具有write权限的token  
-AUTH_USER：网页登陆用户名  
-AUTH_PASSWORD：网页登陆密码  
-BACKUP_MODE：timed 定时 / realtime 实时
-BACKUP_HISTORY_LIMIT：保留几份备份（建议 3~5）
-BACKUP_INTERVAL：定时备份间隔秒（600=10 分钟）
-## 可选
-DATA_DIR：qwenpaw数据文件位置  
-SECRET_DIR：qwenpaw使用的大模型密钥存储位置  
+基于 HuggingFace Dataset 实现 QwenPaw 数据自动备份、实时同步，内置 Nginx 密码认证、项目介绍首页与一键登录入口，开箱即用。
+核心功能
 
+    自动拉取/备份 QwenPaw 配置与密钥数据。
+    timed 定时 / realtime 实时（inotify）双模式备份数据，实时备份加防抖，避免疯狂触发
+    通过变量控制保留几份历史备份（自动删旧的），加入文件过滤，彻底杜绝日志 / 缓存堆积，不产生历史冗余文件；历史文件按时间戳存储，自动清理超量文件。
+    Nginx Basic Auth 安全访问控制。
+    使用私有dataset,保护隐私。
+    中文环境 + 上海时区，适配国内使用。
+
+快速部署
+
+    新建 HuggingFace Spaces → 选择 Docker → Blank 模板
+    上传以下文件：
+        Dockerfile
+        start.sh
+        README.md
+    配置环境变量 → 提交自动构建启动
+
+环境变量
+变量名 	必填 	默认值 	说明
+HF_USERNAME 	✅ 	- 	HuggingFace 用户名
+HF_TOKEN 	✅ 	- 	HF 令牌（需写入权限）
+AUTH_USER 	❌ 	admin 	登录用户名
+AUTH_PASSWORD 	❌ 	SecurePass123 	登录密码（建议修改）
+DATA_DIR 	❌ 	/root/.qwenpaw 	qwenpaw配置保存目录
+SECRET_DIR 	❌ 	/root/.qwenpaw.secret 	qwenpaw密钥保存目录
+DATASET 	❌ 	qwenpaw-backup 	备份数据集名
+BACKUP_MODE 	❌ 	timed 	timed 定时 / realtime 实时
+BACKUP_HISTORY_LIMIT 	❌ 	3 	保留几份备份（建议 3~5）
+BACKUP_INTERVAL 	❌ 	600 	定时备份间隔秒（600=10 分钟）
+REALTIME_DEBOUNCE 	❌ 	2 	实时备份防抖（文件变动后等待N秒再备份，避免频繁触发）
+访问方式
+
+    https://{spaces名}.hf.space/
+
+安全提示
+
+    务必修改默认登录密码，防止未授权访问
+    HF Token 请开启数据集写入权限
+    备份数据集建议设为私有
