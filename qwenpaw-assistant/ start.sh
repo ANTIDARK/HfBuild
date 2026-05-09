@@ -1,206 +1,338 @@
 #!/bin/bash
 set -euo pipefail
 
-# ===================== 安全配置 =====================
+# ===================== 防重复执行锁 =====================
+LOCK_FILE="/tmp/qwenpaw_start.lock"
+if [ -f "${LOCK_FILE}" ]; then
+    echo "⚠️  检测到脚本已在运行，跳过重复启动"
+    exit 0
+fi
+touch "${LOCK_FILE}"
+trap "rm -f ${LOCK_FILE}" EXIT
+
+# ===================== 配置（可通过环境变量覆盖）=====================
+# 网页认证
 AUTH_USER="${AUTH_USER:-admin}"
 AUTH_PASSWORD="${AUTH_PASSWORD:-SecurePass123}"
+# HF 配置（必须在Space环境变量里设置）
+HF_USERNAME="${HF_USERNAME}"
+HF_TOKEN="${HF_TOKEN}"
+DATASET="${DATASET:-qwenpaw-backup}"
+DATASET_ID="${HF_USERNAME}/${DATASET}"
+DATASET_BRANCH="${DATASET_BRANCH:-main}"
+# 备份目录
+QWENPAW_WORKING_DIR="${QWENPAW_WORKING_DIR:-"/root/.qwenpaw"}"
+QWENPAW_SECRET_DIR="${QWENPAW_SECRET_DIR:-"/root/.qwenpaw.secret"}"
+DIR1="${QWENPAW_WORKING_DIR}"
+DIR2="${QWENPAW_SECRET_DIR}"
+# 备份配置
+BACKUP_MODE="${BACKUP_MODE:-timed}"
+BACKUP_HISTORY_LIMIT="${BACKUP_HISTORY_LIMIT:-3}"
+BACKUP_INTERVAL="${BACKUP_INTERVAL:-600}"
+REALTIME_DEBOUNCE="${REALTIME_DEBOUNCE:-2}"
 
-# HF 必传环境变量检查
-if [ -z "${HF_USERNAME:-}" ] || [ -z "${HF_TOKEN:-}" ]; then
-    echo "❌ 错误：必须设置 HF_USERNAME 和 HF_TOKEN 环境变量"
+# ================================================
+# 首次初始化配置qwenpaw
+#qwenpaw init --defaults
+#sleep 2
+
+# ================================================
+# 前置校验
+if [ -z "${HF_USERNAME}" ] || [ -z "${HF_TOKEN}" ]; then
+    echo "❌ 致命错误：必须设置 HF_USERNAME 和 HF_TOKEN 环境变量"
+    exit 1
+fi
+if [ "${BACKUP_HISTORY_LIMIT}" -lt 1 ]; then
+    echo "❌ 致命错误：BACKUP_HISTORY_LIMIT 必须大于等于1"
     exit 1
 fi
 
-HF_USERNAME="${HF_USERNAME}"
-HF_TOKEN="${HF_TOKEN}"
-DATA_DIR="/root/.qwenpaw"
-SECRET_DIR="/root/.qwenpaw.secret"
-DATASET="${DATASET:-qwenpaw-backup}"
-DATASET_ID="${HF_USERNAME}/${DATASET}"
-BACKUP_TIME="${BACKUP_TIME:-300}"
+# 目录创建
+mkdir -p "${DIR1}" "${DIR2}"
+TMP_ROOT="/tmp/qwenpaw_backup"
+rm -rf "${TMP_ROOT}" && mkdir -p "${TMP_ROOT}"
 
-DIR1="${DATA_DIR}"
-DIR2="${SECRET_DIR}"
-# ====================================================
+# ==================== 安全打包（无tar警告） ====================
+make_clean_archive() {
+  local archive="${1:-}"
+  if [ -z "${archive}" ]; then
+    echo "❌ 打包错误：未指定归档文件"
+    return 1
+  fi
+  
+  rm -f "${archive}"
+  
+  # 生成临时排除文件
+  local exclude_file="${TMP_ROOT}/exclude.txt"
+  cat > "${exclude_file}" << 'EOF'
+logs
+*.log
+tmp
+temp
+cache
+__pycache__
+*.pyc
+*.pyo
+.git
+.gitignore
+.lock
+*.lock
+EOF
 
-# 依赖检查
-check_deps() {
-    for cmd in python nginx htpasswd; do
-        if ! command -v $cmd &>/dev/null; then
-            echo "❌ 缺少依赖：$cmd，请先安装"
-            exit 1
-        fi
-    done
-
-    if ! python -c "import huggingface_hub" &>/dev/null; then
-        echo "⚠️ 安装 huggingface_hub..."
-        pip install huggingface_hub -q
-    fi
+  cd /root
+  tar -zcf "${archive}" --ignore-failed-read \
+    --exclude-from="${exclude_file}" \
+    .qwenpaw .qwenpaw.secret 2>/dev/null || true
+  
+  rm -f "${exclude_file}"
 }
-check_deps
 
-# 端口检查
-check_ports() {
-    for p in 8088 7860; do
-        if lsof -i:$p -t >/dev/null 2>&1; then
-            echo "❌ 端口 $p 被占用"
-            exit 1
-        fi
-    done
-}
-check_ports
-
-# ===================== 连通测试 =====================
-test_connection() {
-  echo -e "\n====================================="
-  echo "🔒 私有 Dataset 连通性测试"
-  echo "====================================="
-  python -c "
+# ==================== 空Dataset判断（不卡死） ====================
+pull_latest_backup() {
+  # 快速检查Dataset是否有备份文件
+  local has_backup="NO"
+  has_backup=$(python3 -c "
 from huggingface_hub import HfApi
-api = HfApi()
+api = HfApi(token='${HF_TOKEN}')
 try:
-    api.repo_info(token='${HF_TOKEN}', repo_id='${DATASET_ID}', repo_type='dataset')
-    print('✅ 连接成功')
+    files = api.list_repo_files(repo_id='${DATASET_ID}', repo_type='dataset', revision='${DATASET_BRANCH}')
+    for f in files:
+        if f.startswith('qwenpaw_backup_') and f.endswith('.tar.gz'):
+            print('YES')
+            exit(0)
+    print('NO')
 except Exception as e:
-    print('❌ 连接失败：', e)
-    exit(1)
-"
-  echo "=====================================\n"
-}
-test_connection
+    print('NO')
+" 2>/dev/null || echo "NO")
 
+  if [ "${has_backup}" != "YES" ]; then
+    echo "ℹ️ Dataset为空，跳过恢复"
+    return
+  fi
 
-# ========== 拉取备份 ==========
-pull_all_backup() {
-    BACKUP_ROOT="/root/hf_backup_tmp"
-    [ -d "${BACKUP_ROOT}" ] && rm -rf "${BACKUP_ROOT}"
-    mkdir -p "${BACKUP_ROOT}"
+  # 有备份才下载恢复
+  echo "📥 发现备份，开始恢复..."
+  local tmp_dir="/tmp/restore"
+  rm -rf "${tmp_dir}" && mkdir -p "${tmp_dir}"
 
-    echo "ℹ️ 拉取备份..."
-    python -c "
+  python3 -c "
 from huggingface_hub import snapshot_download
 try:
     snapshot_download(
         repo_id='${DATASET_ID}',
         repo_type='dataset',
-        local_dir='${BACKUP_ROOT}',
+        revision='${DATASET_BRANCH}',
+        local_dir='${tmp_dir}',
         token='${HF_TOKEN}',
-        resume_download=True
+        allow_patterns=['qwenpaw_backup_*.tar.gz'],
+        force_download=True,
+        max_workers=1
     )
-except:
+except Exception as e:
     pass
-"
+" 2>&1 | head -10 || true
 
-
-    if [ -d "${BACKUP_ROOT}/.qwenpaw" ]; then
-        rm -rf "${DIR1}"
-        mv "${BACKUP_ROOT}/.qwenpaw" /root/
-        echo "✅ 恢复 ${DIR1}"
-    fi
-
-    if [ -d "${BACKUP_ROOT}/.qwenpaw.secret" ]; then
-        rm -rf "${DIR2}"
-        mv "${BACKUP_ROOT}/.qwenpaw.secret" /root/
-        echo "✅ 恢复 ${DIR2}"
-    fi
-
-    rm -rf "${BACKUP_ROOT}"
+  # 解压
+  latest=$(ls -t ${tmp_dir}/qwenpaw_backup_*.tar.gz 2>/dev/null | head -1 || true)
+  if [ -n "${latest:-}" ] && [ -f "${latest}" ]; then
+    cd /root
+    tar -zxf "${latest}" -C /root/ 2>/dev/null || true
+    echo "✅ 配置恢复成功"
+  fi
+  rm -rf "${tmp_dir}"
 }
-pull_all_backup
 
-# ========== 【实时同步】文件一改动就自动上传 ==========
-# ========== 【修复版】文件实时同步 ==========
-auto_double_backup() {
-    # 安装依赖
-    if ! command -v inotifywait &>/dev/null; then
-        apt update && apt install -y inotify-tools -y
-    fi
+# ==================== 上传+历史清理（修正API参数名） ====================
+upload_and_purge_history() {
+  local archive="${1:-}"
+  if [ -z "${archive}" ] || [ ! -f "${archive}" ]; then
+    echo "❌ 上传错误：归档文件不存在"
+    return 1
+  fi
+  
+  local filename="$(basename "${archive}")"
 
-    echo "✅ 实时同步已启动 → 监听：$DIR1 $DIR2"
-    echo "✅ 文件一旦修改，自动同步到云端"
+  # 环境变量传递
+  export HF_TOKEN
+  export DATASET_ID
+  export DATASET_BRANCH
+  export BACKUP_HISTORY_LIMIT
+  export ARCHIVE="${archive}"
+  export FILENAME="${filename}"
 
-    # 首次同步
-    sync_files
+  # Python清理逻辑：全链路日志+异常暴露+兼容旧文件+修正delete_file参数名为path_in_repo
+  python3 << 'EOF'
+import os
+import sys
+from huggingface_hub import HfApi
 
-    # 无限循环监听（去掉 -m，正常触发）
+# 环境变量校验
+required_env = ['HF_TOKEN', 'DATASET_ID', 'DATASET_BRANCH', 'BACKUP_HISTORY_LIMIT', 'ARCHIVE', 'FILENAME']
+for env in required_env:
+    if env not in os.environ or not os.environ[env]:
+        print(f"❌ 环境变量缺失：{env}")
+        sys.exit(1)
+
+api = HfApi(token=os.environ['HF_TOKEN'])
+repo_id = os.environ['DATASET_ID']
+revision = os.environ['DATASET_BRANCH']
+keep = int(os.environ['BACKUP_HISTORY_LIMIT'])
+archive = os.environ['ARCHIVE']
+filename = os.environ['FILENAME']
+
+# 上传新备份（带日志）
+print(f"\n📤 开始上传备份：{filename}")
+try:
+    api.upload_file(
+        path_or_fileobj=archive,
+        path_in_repo=filename,
+        repo_id=repo_id,
+        repo_type='dataset',
+        revision=revision
+    )
+    print(f"✅ 上传成功：{filename}")
+except Exception as e:
+    print(f"❌ 上传失败：{str(e)}")
+    sys.exit(1)
+
+# 获取备份文件
+print(f"\n📦 获取仓库备份文件列表...")
+try:
+    all_files = api.list_repo_files(repo_id=repo_id, repo_type='dataset', revision=revision)
+except Exception as e:
+    print(f"❌ 获取文件列表失败：{str(e)}")
+    sys.exit(1)
+
+# 过滤备份文件
+backup_files = []
+for f in all_files:
+    if f.startswith('qwenpaw_backup_') and f.endswith('.tar.gz'):
+        backup_files.append(f)
+
+if not backup_files:
+    print("ℹ️ 仓库中无匹配的备份文件，无需清理")
+    sys.exit(0)
+
+# 强制按时间戳降序排序（新文件在前）
+backup_files.sort(reverse=True)
+print(f"✅ 找到备份文件：共{len(backup_files)}个")
+print(f"📋 排序后列表：{backup_files}")
+print(f"🔢 保留最新{keep}个，删除剩余{len(backup_files)-keep}个")
+
+# 删除超量旧备份（暴露异常，不静默跳过）
+# 优化：防限流分批删除】
+# 单次最多删5个，防高频限流
+MAX_DELETE_PER_TIME = 5 
+# 每删一个休眠1秒
+DELETE_SLEEP_SEC = 1      
+
+if len(backup_files) > keep:
+    to_delete = backup_files[keep:]
+    # 限制单次最多删MAX_DELETE_PER_TIME个
+    to_delete = to_delete[:MAX_DELETE_PER_TIME]
+    
+    print(f"⚠️  本次分批清理，最多删除 {MAX_DELETE_PER_TIME} 个旧备份")
+    for idx, f in enumerate(to_delete):
+        try:
+            print(f"🗑️  [{idx+1}] 正在删除：{f}")
+            api.delete_file(
+                path_in_repo=f,
+                repo_id=repo_id,
+                repo_type='dataset',
+                revision=revision
+            )
+            print(f"✅ 删除成功：{f}")
+            # 每删一个休眠，降频防限流
+            import time
+            time.sleep(DELETE_SLEEP_SEC)
+        except Exception as e:
+            err_msg = str(e).lower()
+            # 遇到429限流直接终止本次删除，下次备份再清
+            if "429" in err_msg or "too many requests" in err_msg:
+                print("❌ 触发HF API限流，停止本次清理，下次备份自动继续")
+                break
+            print(f"❌ 删除失败：{f}，原因：{str(e)}")
+else:
+    print(f"ℹ️ 当前备份数量未超过限制，无需清理")
+
+print(f"\n✅ 备份+清理流程全部完成")
+EOF
+}
+
+# ==================== 备份执行 ====================
+do_backup() {
+  local ts=$(date +%Y%m%d_%H%M%S)
+  local archive="${TMP_ROOT}/qwenpaw_backup_${ts}.tar.gz"
+  
+  make_clean_archive "${archive}"
+  
+  if [ -f "${archive}" ]; then
+    upload_and_purge_history "${archive}"
+    rm -f "${archive}"
+    echo "✅ [${ts}] 备份完成"
+  fi
+}
+
+# ==================== 启动流程 ====================
+echo "====================================="
+echo "🔒 备份模式：${BACKUP_MODE}"
+echo "📦 保留历史：${BACKUP_HISTORY_LIMIT}"
+echo "====================================="
+
+# 检查Dataset
+python3 -c "
+from huggingface_hub import HfApi
+api = HfApi(token='${HF_TOKEN}')
+try:
+    api.repo_info(repo_id='${DATASET_ID}', repo_type='dataset', revision='${DATASET_BRANCH}')
+    print('✅ Dataset 连接正常')
+except:
+    print('❌ Dataset 连接失败')
+" 2>/dev/null || true
+
+# 执行恢复
+pull_latest_backup
+
+# 启动备份任务
+if [ "${BACKUP_MODE}" = "realtime" ]; then
+  echo "⏱️  实时备份已启动"
+  (
     while true; do
-        # 关键：去掉 -m，一次事件就退出，才能执行同步
-        inotifywait -e create,delete,modify,move -r "$DIR1" "$DIR2" 2>/dev/null
-        echo "🔄 检测到文件变化，开始同步..."
-        sync_files
+      inotifywait -r -q -e create,delete,modify,move \
+        --exclude 'log|lock|tmp' "${DIR1}" "${DIR2}" 2>/dev/null || true
+      sleep ${REALTIME_DEBOUNCE}
+      do_backup
     done
-}
+  ) &
+else
+  echo "⏱️  定时备份：${BACKUP_INTERVAL} 秒"
+  (
+    while true; do
+      sleep ${BACKUP_INTERVAL}
+      do_backup
+    done
+  ) &
+fi
 
-# 同步函数（不变）
-sync_files() {
-    SYNC_TMP="/root/sync_tmp"
-    mkdir -p "$SYNC_TMP"
+# ==================== Nginx ====================
+htpasswd -cb /etc/nginx/.htpasswd "${AUTH_USER}" "${AUTH_PASSWORD}" 2>/dev/null || true
 
-    # 增量拉取云端最新
-    python -c "
-from huggingface_hub import snapshot_download
-try:
-    snapshot_download(
-        repo_id='${DATASET_ID}',
-        repo_type='dataset',
-        local_dir='${SYNC_TMP}',
-        token='${HF_TOKEN}',
-        resume_download=True
-    )
-except:
-    pass
-"
-
-    # 覆盖本地变更
-    [ -d "$DIR1" ] && cp -rf "$DIR1" "$SYNC_TMP"/
-    [ -d "$DIR2" ] && cp -rf "$DIR2" "$SYNC_TMP"/
-
-    # 增量上传
-    python -c "
-from huggingface_hub import HfApi
-try:
-    api = HfApi()
-    api.upload_folder(
-        folder_path='${SYNC_TMP}',
-        repo_id='${DATASET_ID}',
-        repo_type='dataset',
-        token='${HF_TOKEN}'
-    )
-except Exception as e:
-    print('同步失败：', e)
-"
-
-    rm -rf "$SYNC_TMP"
-    echo "✅ $(date '+%Y-%m-%d %H:%M:%S') 同步完成"
-}
-auto_double_backup &
-
-# ===================== Nginx =====================
-htpasswd -cb /etc/nginx/.htpasswd "${AUTH_USER}" "${AUTH_PASSWORD}"
-
-# 备份原有配置
-[ -f /etc/nginx/sites-enabled/default ] && \
-cp /etc/nginx/sites-enabled/default /etc/nginx/sites-enabled/default.bak.$(date +%s)
-
-cat > /etc/nginx/sites-enabled/default << EOF
+cat > /etc/nginx/sites-enabled/default << 'EOF'
 server {
     listen 7860;
     auth_basic "Private qwenpaw";
     auth_basic_user_file /etc/nginx/.htpasswd;
     location / {
         proxy_pass http://127.0.0.1:8088/;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Host $host;
     }
 }
 EOF
 
-# ===================== 启动应用 =====================
-echo 当前时间：$(date '+%Y年%m月%d日 %H:%M:%S 星期%w')
-echo "ℹ️ 启动 qwenpaw..."
-qwenpaw app --host 127.0.0.1 --port 8088 &
-sleep 3
+# ==================== 启动QwenPaw ====================
+echo "🚀 启动 QwenPaw..."
+copaw app --host 127.0.0.1 --port 8088 --log-level WARNING --reload &
+sleep 2
 
-# 等待所有后台进程 + 前台 Nginx
-wait &
+echo -e "\n✅ QwenPaw 启动成功"
 nginx -g "daemon off;"
