@@ -13,7 +13,17 @@ RUN apk add --no-cache \
 WORKDIR /app
 
 # 克隆 FreeLLMAPI
-RUN git clone https://github.com/tashfeenahmed/freellmapi.git .
+# RUN git clone https://github.com/tashfeenahmed/freellmapi.git .
+# 方案 A：指定 Git Tag（推荐，可复现）
+#ARG FREELLMAPI_VERSION="v0.2.8"
+#RUN git clone --depth 1 --branch ${FREELLMAPI_VERSION} \
+    #https://github.com/tashfeenahmed/freellmapi.git .
+
+# 方案 B：下载 Release Tarball（更快，无 Git 历史）
+ARG FREELLMAPI_VERSION="v0.2.8"
+RUN apk add --no-cache curl && \
+    curl -L "https://github.com/tashfeenahmed/freellmapi/archive/refs/tags/${FREELLMAPI_VERSION}.tar.gz" | \
+    tar xz --strip-components=1
 
 # 安装 Node 依赖并构建
 RUN npm install && npm run build
